@@ -1,7 +1,9 @@
 import json
 from collections import Counter
+from sklearn.model_selection import train_test_split
+import os
 
-def load_dataset(path="/root/praxis/dataset.jsonl"):
+def load_dataset(path="dataset.jsonl"):
     processed = []
 
     with open(path, 'r', encoding='utf-8') as f:
@@ -35,7 +37,6 @@ def load_dataset(path="/root/praxis/dataset.jsonl"):
 
     return processed
 
-
 def compute_statistics(pairs):
     total_pairs = len(pairs)
     aspect_counter = Counter([pair["aspect"] for pair in pairs])
@@ -51,8 +52,6 @@ def compute_statistics(pairs):
         print(f"Pair {i + 1}")
         print(f"Sentence: {example['sentence']}")
         print(f"Aspect: {example['aspect']}")
-
-        # Извлекаем только строки ключевых фраз
         kps_extracted = []
         if isinstance(example['keyphrases'], list):
             for kp_item in example['keyphrases']:
@@ -69,8 +68,21 @@ def compute_statistics(pairs):
     print(f"Number of unique aspects: {unique_aspects}")
     print(f"Number of unique sentences: {total_sentences}")
 
+def save_jsonl(data, path):
+    with open(path, 'w', encoding='utf-8') as f:
+        for item in data:
+            f.write(json.dumps(item, ensure_ascii=False) + '\n')
 
 if __name__ == "__main__":
-    dataset_path = "/root/praxis/dataset.jsonl"
+    dataset_path = "dataset.jsonl"  # файл должен лежать рядом
     pairs = load_dataset(dataset_path)
     compute_statistics(pairs)
+
+    train_data, test_data = train_test_split(pairs, test_size=0.2, random_state=42)
+
+    save_jsonl(train_data, "train_ds.jsonl")
+    save_jsonl(test_data, "test_ds.jsonl")
+
+    print("\n[INFO] saved:")
+    print(" - train.jsonl")
+    print(" - test.jsonl")

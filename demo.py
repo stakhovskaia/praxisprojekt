@@ -2,34 +2,42 @@ import sys
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 import unsloth
-import torch,os
-from transformers import (
-    EvalPrediction,
-    TrainingArguments
-)
+import torch
+import os
+from transformers import EvalPrediction, TrainingArguments
 from unsloth import is_bfloat16_supported
 from unsloth.chat_templates import get_chat_template
 from trl import SFTTrainer
 from evaluate import load
-from prompt import prompts
 from datasets import load_dataset, Dataset, DatasetDict
 import json
+import logging
+from sklearn.metrics import accuracy_score, f1_score, recall_score
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class KPS:
     def __init__(self):
-        # load model and tokenizer
+        # Загружаем модель и токенизатор
         self.model_name = "unsloth/llama-3-8b-bnb-4bit"
         self.model, self.tokenizer = unsloth.FastLanguageModel.from_pretrained(
             model_name=self.model_name,
             max_seq_length=4096,
             load_in_4bit=True,
-            dtype=None
+            dtype=None,
+            device_map="auto"
         )
 
-        # apply chat template
+        # Устанавливаем устройство: GPU или CPU
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Using device: {self.device}")
+
+        # Применяем шаблон чата
         self.tokenizer = get_chat_template(
             self.tokenizer,
-            chat_template = "llama-3", # Supports zephyr, chatml, mistral, llama, alpaca, vicuna, vicuna_old, unsloth
+            chat_template="llama-3"
         )
 
     @staticmethod
@@ -59,17 +67,17 @@ class KPS:
                                 processed.append({
                                     "Sentences": sentence_text,
                                     "Aspect": aspect,
-                                    "Kps": kps
+                                    "Kps": kps.get("kps", [])  # Извлекаем только список kps
                                 })
 
                 except json.JSONDecodeError as e:
-                    print(f"[ERROR] JSON parse error: {e}")
+                    logger.error(f"JSON parse error: {e}")
 
-        print(f"[DEBUG] Parsed examples: {len(processed)}")
+        logger.info(f"Parsed examples: {len(processed)}")
         if not processed:
             raise RuntimeError("No training pairs were parsed. Check dataset structure.")
 
-        # 80/20 split
+        # Разделяем на train/test (80/20)
         split = int(0.8 * len(processed))
         train_data = processed[:split]
         test_data = processed[split:]
@@ -79,48 +87,46 @@ class KPS:
             "test": Dataset.from_list(test_data)
         })
 
-
     def __formatting_prompts_func(self, batch):
+        from prompt import prompts
         sentences = batch['Sentences']
-        aspcets = batch['Aspect']
+        aspects = batch['Aspect']  # Исправлено: aspcets → aspects
         kps = batch['Kps']
 
         texts = []
-        for sentences, kps, aspect in zip(sentences, kps, aspcets):
+        for sentence, kp, aspect in zip(sentences, kps, aspects):
             message = [
                 {"role": "system", "content": "You are a great assistant for summarizing medical documents. Please follow the instructions strictly."},
-                {"role": "user", "content": prompts(sentences, aspect=aspect)},
-                {"role": "assistant", "content": f"**Key Phrases**: {kps}"}
+                {"role": "user", "content": prompts(sentence, aspect=aspect)},
+                {"role": "assistant", "content": f"**Key Phrases**: {{'kps': {kp}}}"}
             ]
             texts.append(self.tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=False))
 
-        return {"text": texts,}
-    
+        return {"text": texts}
+
     def __load_data(self, path="/root/praxis/dataset.jsonl"):
         dataset = KPS.load_custom_dataset(path=path)
         
-        # need your action
-        
-
-        # split dataset to train and test
         train_dataset = dataset["train"]
         test_dataset = dataset["test"]
         
         train_dataset = train_dataset.map(
             self.__formatting_prompts_func,
-            batched = True,
+            batched=True,
             remove_columns=train_dataset.column_names
         )
-
+        
         test_dataset = test_dataset.map(
             self.__formatting_prompts_func,
-            batched = True,
+            batched=True,
             remove_columns=test_dataset.column_names
         )
         
+        # Выводим первые 3 примера для отладки
+        for i in range(min(3, len(train_dataset))):
+            logger.info(f"Train example {i+1}: {train_dataset[i]['text']}")
+        
         return train_dataset, test_dataset
-    
-    
 
     def __load_model(self):
         model = unsloth.FastLanguageModel.get_peft_model(
@@ -131,14 +137,54 @@ class KPS:
             lora_dropout=0,
             bias="none",
             use_gradient_checkpointing="unsloth",
-            random_state = 32,
+            random_state=32,
             use_rslora=True,
-            loftq_config = None
+            loftq_config=None
         )
-        print(model.print_trainable_parameters())
-
+        logger.info(model.print_trainable_parameters())
         return model, self.tokenizer
-    
+
+    def extract_key_phrases(self, text):
+        """
+        Извлекает список ключевых фраз из текста модели.
+        
+        Args:
+            text: Строка с выводом модели (например, "**Key Phrases**: {...}")
+        
+        Returns:
+            Список ключевых фраз или пустой список при ошибке
+        """
+        try:
+            text = text.strip()
+            logger.debug(f"Input text for extraction: {text}")
+            
+            # Ищем шаблон "**Key Phrases**: {...}"
+            pattern = r"\*\*Key Phrases\*\*:\s*\{.*?\}"
+            match = re.search(pattern, text, re.DOTALL)
+            if not match:
+                logger.warning(f"No Key Phrases pattern found in text: {text}")
+                return []
+            
+            # Извлекаем словарь
+            dict_str = match.group(0).split(":", 1)[1].strip()
+            
+            # Заменяем одинарные кавычки на двойные
+            dict_str = dict_str.replace("'", '"')
+            
+            # Парсим JSON
+            kp_dict = json.loads(dict_str)
+            kps = kp_dict.get("kps", [])
+            
+            logger.info(f"Extracted key phrases: {kps}")
+            return kps
+        
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {e}, input: {dict_str}")
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}, input: {text}")
+            return []
+
     def __compute_metrics(self, eval_pred: EvalPrediction):
         predictions = eval_pred.predictions[0]
         predictions[predictions == -100] = self.tokenizer.pad_token_id
@@ -146,39 +192,73 @@ class KPS:
         label_ids = eval_pred.label_ids
         label_ids[label_ids == -100] = self.tokenizer.pad_token_id
 
-        # Decode predictions to text
+        # Декодируем предсказания и эталоны
         decoded_predictions = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
-
-        # Decode labels to text, ensuring to skip the special token -100 used for ignored indices
         references = self.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
-        print(f"Number of predictions: {len(decoded_predictions)}, Number of references: {len(references)}")
+        # Извлекаем ключевые фразы
+        decoded_predictions_kps_list = [self.extract_key_phrases(pred) for pred in decoded_predictions]
+        references_kps_list = [self.extract_key_phrases(ref) for ref in references]
 
+        # Логируем первые 5 примеров
+        n = 5
+        for i in range(min(n, len(decoded_predictions))):
+            logger.info(
+                f"Example {i+1}:\n"
+                f"Raw Prediction: {decoded_predictions[i]}\n"
+                f"Predicted KPs: {decoded_predictions_kps_list[i]}\n"
+                f"Reference KPs: {references_kps_list[i]}\n"
+            )
 
-        # load evaluation metric
+        # Проверяем, есть ли предсказания
+        if not any(decoded_predictions_kps_list):
+            logger.warning("All predicted key phrases are empty!")
+            return {
+                "rouge1": 0.0,
+                "rouge2": 0.0,
+                "rougeLsum": 0.0,
+                "bertscore": 0.0,
+                "accuracy": 0.0,
+                "f1": 0.0,
+                "recall": 0.0
+            }
+
+        # Для ROUGE и BERTScore объединяем ключевые фразы в строки
+        decoded_predictions_kps_text = [" ".join(kps) for kps in decoded_predictions_kps_list]
+        references_kps_text = [" ".join(kps) for kps in references_kps_list]
+
+        # Загружаем метрики
         rouge = load("rouge")
         bert_score = load("bertscore", model_type="distilbert-base-uncased")
 
-        # Calculate metrics
-        rouge_result = rouge.compute(predictions=decoded_predictions, references=references)
-        bertscore_result = bert_score.compute(predictions=decoded_predictions, references=references, lang="en")
-        print("+"*100)
-        print(decoded_predictions[0])
-        print("="*100)
-        print(references[0])
+        # Вычисляем ROUGE и BERTScore
+        rouge_result = rouge.compute(predictions=decoded_predictions_kps_text, references=references_kps_text)
+        bertscore_result = bert_score.compute(predictions=decoded_predictions_kps_text, references=references_kps_text, lang="en")
 
-        # Return calculated metrics
-        return {
+        # Вычисляем accuracy, f1, recall для ключевых фраз
+        all_true_keyphrases = [item for sublist in references_kps_list for item in sublist]
+        all_pred_keyphrases = [item for sublist in decoded_predictions_kps_list for item in sublist]
+
+        accuracy = accuracy_score(all_true_keyphrases, all_pred_keyphrases) if all_pred_keyphrases else 0.0
+        f1 = f1_score(all_true_keyphrases, all_pred_keyphrases, average="weighted") if all_pred_keyphrases else 0.0
+        recall = recall_score(all_true_keyphrases, all_pred_keyphrases, average="weighted") if all_pred_keyphrases else 0.0
+
+        # Возвращаем метрики
+        metrics = {
             "rouge1": rouge_result["rouge1"],
             "rouge2": rouge_result["rouge2"],
             "rougeLsum": rouge_result["rougeLsum"],
-            "bertscore": bertscore_result["f1"][0]
+            "bertscore": bertscore_result["f1"][0],
+            "accuracy": accuracy,
+            "f1": f1,
+            "recall": recall
         }
-    
+        logger.info(f"Metrics: {metrics}")
+        return metrics
+
     def __preprocess_logits_for_metrics(self, logits, labels):
         """
-        Original Trainer may have a memory leak. 
-        This is a workaround to avoid storing too many tensors that are not needed.
+        Избегаем утечек памяти, выбирая только нужные тензоры.
         """
         pred_ids = torch.argmax(logits, dim=-1)
         return pred_ids, labels
@@ -194,11 +274,10 @@ class KPS:
             eval_dataset=test_dataset,
             dataset_text_field="text",
             max_seq_length=4096,
-            # data_collator = DataCollatorForSeq2Seq(tokenizer = self.tokenizer, max_length=2048),
             dataset_num_proc=2,
             packing=False,
             compute_metrics=self.__compute_metrics,
-            preprocess_logits_for_metrics = self.__preprocess_logits_for_metrics,
+            preprocess_logits_for_metrics=self.__preprocess_logits_for_metrics,
             args=TrainingArguments(
                 per_device_train_batch_size=2,
                 per_device_eval_batch_size=2,
@@ -221,15 +300,14 @@ class KPS:
                 save_total_limit=5,
                 load_best_model_at_end=True,
                 output_dir="output",
-                report_to = None,
+                report_to=None,
             ),
         )
 
-        trainer.train(resume_from_checkpoint=True)
+        # Запускаем обучение
+        trainer.train(resume_from_checkpoint=False)  # Сбросили обучение
         trainer.save_model("best_models")
 
 if __name__ == "__main__":
     kps = KPS()
     kps.train()
-
-    
